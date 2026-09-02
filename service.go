@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/anytls/sing-anytls/session"
@@ -21,7 +22,9 @@ import (
 )
 
 type Service struct {
-	users           map[[32]byte]string
+	usersMu         sync.RWMutex
+	users           map[[32]byte]string // sha256(password) -> name
+	userNameToHash  map[string][32]byte // name -> sha256(password)
 	padding         atomic.TypedValue[*padding.PaddingFactory]
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
@@ -47,15 +50,14 @@ func NewService(config ServiceConfig) (*Service, error) {
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
 		users:           make(map[[32]byte]string),
+		userNameToHash:  make(map[string][32]byte),
 	}
 
 	if service.handler == nil || service.logger == nil {
 		return nil, os.ErrInvalid
 	}
 
-	for _, user := range config.Users {
-		service.users[sha256.Sum256([]byte(user.Password))] = user.Name
-	}
+	service.users, service.userNameToHash = makeUserIndexes(config.Users)
 
 	if !padding.UpdatePaddingScheme(config.PaddingScheme, &service.padding) {
 		return nil, errors.New("incorrect padding scheme format")
@@ -64,12 +66,87 @@ func NewService(config ServiceConfig) (*Service, error) {
 	return service, nil
 }
 
+// UpdateUsers atomically replaces the entire user set. Equivalent to
+// removing every current user and re-adding the given list. Kept for
+// callers that already rebuild a full user list each refresh cycle; new
+// callers should prefer AddUsers/RemoveUsers for incremental updates.
 func (s *Service) UpdateUsers(users []User) {
-	u := make(map[[32]byte]string)
-	for _, user := range users {
-		u[sha256.Sum256([]byte(user.Password))] = user.Name
+	newUsers, newName2Hash := makeUserIndexes(users)
+	s.usersMu.Lock()
+	s.users = newUsers
+	s.userNameToHash = newName2Hash
+	s.usersMu.Unlock()
+}
+
+// AddUsers adds or updates users by Name. If a user with the same Name
+// already exists, its previous password hash is removed before inserting
+// the new one; AddUsers also works as "rotate password" for an
+// existing user. Hashing is performed outside the write lock; the lock
+// is held only across the map mutations.
+func (s *Service) AddUsers(users []User) {
+	if len(users) == 0 {
+		return
 	}
-	s.users = u
+	pending := make([]struct {
+		name string
+		hash [32]byte
+	}, len(users))
+	for i, user := range users {
+		pending[i].name = user.Name
+		pending[i].hash = sha256.Sum256([]byte(user.Password))
+	}
+
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	for _, p := range pending {
+		if oldName, ok := s.users[p.hash]; ok && oldName != p.name {
+			delete(s.userNameToHash, oldName)
+		}
+		if oldHash, ok := s.userNameToHash[p.name]; ok && oldHash != p.hash {
+			delete(s.users, oldHash)
+		}
+		s.users[p.hash] = p.name
+		s.userNameToHash[p.name] = p.hash
+	}
+}
+
+// RemoveUsers removes users by Name. Unknown names are silently ignored.
+func (s *Service) RemoveUsers(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	for _, name := range names {
+		if hash, ok := s.userNameToHash[name]; ok {
+			delete(s.users, hash)
+			delete(s.userNameToHash, name)
+		}
+	}
+}
+
+func (s *Service) lookupUser(passwordHash [32]byte) (string, bool) {
+	s.usersMu.RLock()
+	user, ok := s.users[passwordHash]
+	s.usersMu.RUnlock()
+	return user, ok
+}
+
+func makeUserIndexes(users []User) (map[[32]byte]string, map[string][32]byte) {
+	userByHash := make(map[[32]byte]string, len(users))
+	hashByName := make(map[string][32]byte, len(users))
+	for _, user := range users {
+		hash := sha256.Sum256([]byte(user.Password))
+		if oldHash, ok := hashByName[user.Name]; ok && oldHash != hash {
+			delete(userByHash, oldHash)
+		}
+		if oldName, ok := userByHash[hash]; ok && oldName != user.Name {
+			delete(hashByName, oldName)
+		}
+		userByHash[hash] = user.Name
+		hashByName[user.Name] = hash
+	}
+	return userByHash, hashByName
 }
 
 // NewConnection `conn` should be plaintext
@@ -90,7 +167,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
-	if user, ok := s.users[passwordSha256]; ok {
+	if user, ok := s.lookupUser(passwordSha256); ok {
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		b.Resize(0, n)
